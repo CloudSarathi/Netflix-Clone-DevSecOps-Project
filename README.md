@@ -924,11 +924,61 @@ You will get this output
 
 <img width="1902" height="967" alt="image" src="https://github.com/user-attachments/assets/b4812574-a0fd-4e8a-9568-727cf971d44a" />
 
-## Step 11 — Kuberenetes Setup
 
-Connect your machines to Putty or Mobaxtreme
+## Step 11 : Deploy the image using Docker
 
+- Kuberenetes Setup
+- Connect your machines to Putty or Mobaxtreme
+- Take-Two Ubuntu 20.04 instances one for k8s master and the other one for worker.
+- Install Kubectl on Jenkins machine also.
+- Kubectl is to be installed on Jenkins also
+
+```bash
+sudo apt update
+sudo apt install curl
+curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+kubectl version --client
 ```
+
+- Part 1 ----------Master Node------------
+
+```bash
+sudo hostnamectl set-hostname K8s-Master
+```
+
+- ----------Worker Node------------
+
+```bash
+sudo hostnamectl set-hostname K8s-Worker
+```
+
+- Part 2 ------------Both Master & Node ------------
+
+```bash
+sudo apt-get update 
+
+sudo apt-get install -y docker.io
+sudo usermod –aG docker Ubuntu
+newgrp docker
+sudo chmod 777 /var/run/docker.sock
+
+sudo curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+
+sudo tee /etc/apt/sources.list.d/kubernetes.list <<EOF
+deb https://apt.kubernetes.io/ kubernetes-xenial main
+EOF
+
+sudo apt-get update
+
+sudo apt-get install -y kubelet kubeadm kubectl
+
+sudo snap install kube-apiserver
+```
+
+- Part 3 --------------- Master ---------------
+
+```bash
 sudo kubeadm init --pod-network-cidr=10.244.0.0/16
 # in case your in root exit from it and run below commands
 mkdir -p $HOME/.kube
@@ -936,3 +986,201 @@ sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
 ```
+
+- ----------Worker Node------------
+
+```bash
+sudo kubeadm join <master-node-ip>:<master-node-port> --token <token> --discovery-token-ca-cert-hash <hash>
+```
+
+- Copy the config file to Jenkins master or the local file manager and save it
+- copy it and save it in documents or another folder save it as secret-file.txt
+- Note: create a secret-file.txt in your file explorer save the config in it and use this at the kubernetes credential section.
+- Install Kubernetes Plugin, Once it's installed successfully
+- goto manage Jenkins --> manage credentials --> Click on Jenkins global --> add credentials
+
+- Install Node_exporter on both master and worker
+- Let's add Node_exporter on Master and Worker to monitor the metrics
+- First, let's create a system user for Node Exporter by running the following command:
+
+```bash
+sudo useradd \
+    --system \
+    --no-create-home \
+    --shell /bin/false node_exporter
+```
+
+- Use the wget command to download the binary.
+
+```bash
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+```
+
+- Extract the node exporter from the archive.
+
+```bash
+tar -xvf node_exporter-1.6.1.linux-amd64.tar.gz
+```
+
+- Move binary to the /usr/local/bin.
+
+```bash
+sudo mv \
+  node_exporter-1.6.1.linux-amd64/node_exporter \
+  /usr/local/bin/
+```
+
+- Clean up, and delete node_exporter archive and a folder.
+
+```bash
+rm -rf node_exporter*
+```
+
+- Next, create a similar systemd unit file.
+
+```bash
+sudo vim /etc/systemd/system/node_exporter.service
+```
+
+- node_exporter.service
+
+```bash
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+StartLimitIntervalSec=500
+StartLimitBurst=5
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+Restart=on-failure
+RestartSec=5s
+ExecStart=/usr/local/bin/node_exporter \
+    --collector.logind
+
+[Install]
+WantedBy=multi-user.target
+
+```
+
+- Replace Prometheus user and group to node_exporter, and update the ExecStart command.
+- To automatically start the Node Exporter after reboot, enable the service.
+
+```bash
+sudo systemctl enable node_exporter
+sudo systemctl start node_exporter
+sudo systemctl status node_exporter
+```
+
+- If you have any issues, check logs with journalctl
+
+```bash
+journalctl -u node_exporter -f --no-pager
+```
+
+- At this point, we have only a single target in our Prometheus. There are many different service discovery mechanisms built into Prometheus. For example, Prometheus can dynamically discover targets in AWS, GCP, and other clouds based on the labels. In the following tutorials, I'll give you a few examples of deploying Prometheus in a cloud-specific environment. For this tutorial, let's keep it simple and keep adding static targets. Also, I have a lesson on how to deploy and manage Prometheus in the Kubernetes cluster.
+- To create a static target, you need to add job_name with static_configs. Go to Prometheus server
+
+```bash
+sudo vim /etc/prometheus/prometheus.yml
+```
+
+- prometheus.yml
+
+```bash
+  - job_name: node_export_masterk8s
+    static_configs:
+      - targets: ["<master-ip>:9100"]
+
+  - job_name: node_export_workerk8s
+    static_configs:
+      - targets: ["<worker-ip>:9100"]
+
+```
+
+- By default, Node Exporter will be exposed on port 9100.
+- Since we enabled lifecycle management via API calls, we can reload the Prometheus config without restarting the service and causing downtime.
+- Before, restarting check if the config is valid.
+
+```bash
+promtool check config /etc/prometheus/prometheus.yml
+```
+
+- Then, you can use a POST request to reload the config.
+
+```bash
+curl -X POST http://localhost:9090/-/reload
+```
+
+- Check the targets section
+
+```bash
+http://<ip>:9090/targets
+```
+
+- final step to deploy on the Kubernetes cluster
+
+```bash
+stage('Deploy to kubernets'){
+            steps{
+                script{
+                    dir('Kubernetes') {
+                        withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k8s', namespace: '', restrictKubeConfigAccess: false, serverUrl: '') {
+                                sh 'kubectl apply -f deployment.yml'
+                                sh 'kubectl apply -f service.yml'
+                        }   
+                    }
+                }
+            }
+        }
+```
+
+- In the Kubernetes cluster(master) give this command
+
+```bash
+kubectl get all 
+kubectl get svc #use anyone
+```
+
+## Step 12: Kubernetes master and slave setup on Ubuntu (20.04)
+
+- Access from a Web browser with
+- <public-ip-of-slave:service port>
+
+## Step 13: Access the Netflix app on the Browser
+
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/c9fd56c4-8e24-40bd-b67a-c7cce5edc16a)
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/0662da82-ad5c-45c1-a81b-10152b33cb44)
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/3d6ace51-0218-475a-8b3d-0a3813c5413f)
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/6db0292e-be3e-40d7-85ef-2541bfc0f79f)
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/008c5e21-4ae8-4c87-a58d-80b43036b217)
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/64d0e773-4ce6-453f-9e77-368547582dd6)
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/3662c450-6ef7-4727-ac3c-c222332ca205)
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/ee08dcf0-de79-4a76-a4ec-fea7aa644e02)
+- ![image](https://github.com/rutikdevops/DevOps-Project-11/assets/109506158/0bfdfbd0-927e-4513-96bd-5029571fc8e3)
+
+## Step 14: Terminate instances
+
+## 🛠️ Author & Community  
+
+This project is crafted by **[Harshhaa](https://github.com/NotHarshhaa)** 💡.  
+I’d love to hear your feedback! Feel free to share your thoughts.  
+
+📧 **Connect with me:**
+
+- **GitHub**: [@NotHarshhaa](https://github.com/NotHarshhaa)  
+- **Blog**: [ProDevOpsGuy](https://blog.prodevopsguytech.com)  
+- **Telegram Community**: [Join Here](https://t.me/prodevopsguy)  
+- **LinkedIn**: [Harshhaa Vardhan Reddy](https://www.linkedin.com/in/harshhaa-vardhan-reddy/)  
+
+---
+
+## ⭐ Support the Project  
+
+If you found this helpful, consider **starring** ⭐ the repository and sharing it with your network! 🚀  
+
+### 📢 Stay Connected  
